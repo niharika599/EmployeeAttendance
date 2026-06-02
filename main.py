@@ -1,10 +1,10 @@
-import asyncio
-from contextlib import asynccontextmanager
+import threading
+import time
 from io import BytesIO
 
 import face_recognition
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from flask import Flask, jsonify, request
 from PIL import Image
 
 from attendance_store import AttendanceStore
@@ -12,167 +12,154 @@ from camera_worker import CameraWorker
 from employee_store import EmployeeStore
 from face_store import FaceStore
 
+app = Flask(__name__)
+
 store = FaceStore()
 attendance = AttendanceStore()
 employees = EmployeeStore(store)
 camera = CameraWorker(store, attendance=attendance)
 
 
-async def _notice_period_checker():
+def _notice_period_checker():
     """Runs every hour. Revokes face access for employees whose 60-day notice period has ended."""
     while True:
         expired = employees.expire_notice_periods()
         for emp_id in expired:
             print(f"[NoticeChecker] Notice period ended — access revoked for {emp_id}")
-        await asyncio.sleep(3600)
+        time.sleep(3600)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await camera.start()
-    checker = asyncio.create_task(_notice_period_checker())
-    yield
-    await camera.stop()
-    checker.cancel()
-
-
-app = FastAPI(title="Face Recognition Door System", lifespan=lifespan)
+# Start background threads when the module loads
+camera.start()
+threading.Thread(target=_notice_period_checker, daemon=True).start()
 
 
 def _decode_image(data: bytes) -> np.ndarray:
     return np.array(Image.open(BytesIO(data)).convert("RGB"))
 
 
-# ── Face utilities (read / delete) ────────────────────────────────────────────
+# ── Face utilities ─────────────────────────────────────────────────────────────
 
 @app.get("/faces")
-async def list_faces():
+def list_faces():
     """Return all registered faces with their employee_id references."""
-    return store.list_faces()
+    return jsonify(store.list_faces())
 
 
-@app.delete("/faces/{face_id}")
-async def delete_face(face_id: str):
+@app.delete("/faces/<face_id>")
+def delete_face(face_id):
     """Remove a face encoding directly by face_id."""
     if not store.remove(face_id):
-        raise HTTPException(404, "Face not found")
-    return {"deleted": face_id}
+        return jsonify({"error": "Face not found"}), 404
+    return jsonify({"deleted": face_id})
 
 
-# ── Validate an uploaded image ─────────────────────────────────────────────────
+# ── Validate an uploaded photo ─────────────────────────────────────────────────
 
 @app.post("/validate")
-async def validate_face(image: UploadFile = File(...)):
+def validate_face():
     """
     Check whether a face in the uploaded image belongs to the allowed set.
-
-    Returns access=granted with name/confidence on match, access=denied otherwise.
+    Form field: image (file)
     """
-    img_array = _decode_image(await image.read())
+    if "image" not in request.files:
+        return jsonify({"error": "image file is required"}), 400
+
+    img_array = _decode_image(request.files["image"].read())
     locations = face_recognition.face_locations(img_array, model="hog")
 
     if not locations:
-        raise HTTPException(400, "No face detected in the uploaded image")
+        return jsonify({"error": "No face detected in the uploaded image"}), 400
 
     encoding = face_recognition.face_encodings(img_array, locations)[0]
     face_id, name, confidence = store.find_match(encoding)
 
-    return {
+    return jsonify({
         "access": "granted" if face_id else "denied",
         "recognized": face_id is not None,
         "face_id": face_id,
         "name": name,
         "confidence": confidence,
-    }
+    })
 
 
 # ── Real-time camera feed ──────────────────────────────────────────────────────
 
 @app.get("/realtime/status")
-async def realtime_status():
+def realtime_status():
     """
     Return the latest recognition result from the live camera feed.
-
-    Fields:
-      - camera_available   : whether a camera was found
-      - face_detected      : whether a face is currently visible
-      - recognized         : whether that face is in the allowed set
-      - name / face_id     : identity if recognized
-      - confidence         : 0-1 similarity score (1 = perfect match)
-      - attendance_marked  : True if a new attendance record was just created
+    Updated every 0.5s by the background camera thread.
     """
-    return camera.state
+    return jsonify(camera.state)
 
 
 # ── Attendance ─────────────────────────────────────────────────────────────────
 
 @app.get("/attendance/today")
-async def attendance_today():
+def attendance_today():
     """Return every attendance entry recorded today."""
-    return attendance.get_today()
+    return jsonify(attendance.get_today())
 
 
 @app.get("/attendance/report")
-async def attendance_report(date: str = Query(default=None, description="YYYY-MM-DD (default: today)")):
+def attendance_report():
     """
     Return one summary row per employee for the given date.
-    Each row includes check_in time, last_seen time, and total_entries.
+    Query param: date=YYYY-MM-DD (default: today)
     """
-    return attendance.get_report(date)
+    return jsonify(attendance.get_report(request.args.get("date")))
 
 
-@app.get("/attendance/employee/{face_id}")
-async def attendance_by_employee(face_id: str):
+@app.get("/attendance/employee/<face_id>")
+def attendance_by_employee(face_id):
     """Return full attendance history for a specific employee."""
     records = attendance.get_by_employee(face_id)
     if not records:
-        raise HTTPException(404, "No attendance records found for this employee")
-    return records
+        return jsonify({"error": "No attendance records found for this employee"}), 404
+    return jsonify(records)
 
 
-@app.get("/attendance/date/{date_str}")
-async def attendance_by_date(date_str: str):
+@app.get("/attendance/date/<date_str>")
+def attendance_by_date(date_str):
     """Return all attendance entries for a specific date (YYYY-MM-DD)."""
     records = attendance.get_by_date(date_str)
     if not records:
-        raise HTTPException(404, f"No attendance records found for {date_str}")
-    return records
+        return jsonify({"error": f"No attendance records found for {date_str}"}), 404
+    return jsonify(records)
 
 
 # ── Employee management ────────────────────────────────────────────────────────
 
-@app.post("/employees", status_code=201)
-async def create_employee(
-    employee_id: str = Form(...),
-    name: str = Form(...),
-    image: UploadFile = File(...),
-    email: str = Form(default=None),
-    department: str = Form(default=None),
-    phone: str = Form(default=None),
-    designation: str = Form(default=None),
-):
+@app.post("/employees")
+def create_employee():
     """
     Register a new employee with their details and face photo.
 
-    Body (multipart/form-data):
-      - employee_id  : unique identifier, e.g. EMP001  (required)
-      - name         : full name                        (required)
-      - image        : clear front-facing photo         (required)
-      - email        : work email                       (optional)
-      - department   : team or department name          (optional)
-      - phone        : contact number                   (optional)
-      - designation  : job title                        (optional)
-
-    The face in the photo is encoded and stored so the employee is
-    recognised by the live camera from this point on.
+    Form fields:
+      - employee_id  (required)
+      - name         (required)
+      - image        (required — file upload)
+      - email        (optional)
+      - department   (optional)
+      - phone        (optional)
+      - designation  (optional)
     """
-    img_array = _decode_image(await image.read())
+    employee_id = request.form.get("employee_id")
+    name = request.form.get("name")
+
+    if not employee_id or not name:
+        return jsonify({"error": "employee_id and name are required"}), 400
+    if "image" not in request.files:
+        return jsonify({"error": "image file is required"}), 400
+
+    img_array = _decode_image(request.files["image"].read())
     locations = face_recognition.face_locations(img_array, model="hog")
 
     if not locations:
-        raise HTTPException(400, "No face detected in the uploaded image")
+        return jsonify({"error": "No face detected in the uploaded image"}), 400
     if len(locations) > 1:
-        raise HTTPException(400, "Multiple faces found; upload a photo with one face only")
+        return jsonify({"error": "Multiple faces found; upload a photo with one face only"}), 400
 
     encoding = face_recognition.face_encodings(img_array, locations)[0]
     face_id = store.add(name, encoding, employee_id=employee_id)
@@ -182,47 +169,51 @@ async def create_employee(
             employee_id=employee_id,
             name=name,
             face_id=face_id,
-            email=email,
-            department=department,
-            phone=phone,
-            designation=designation,
+            email=request.form.get("email"),
+            department=request.form.get("department"),
+            phone=request.form.get("phone"),
+            designation=request.form.get("designation"),
         )
     except ValueError as e:
         store.remove(face_id)   # rollback face if employee_id is duplicate
-        raise HTTPException(409, str(e))
+        return jsonify({"error": str(e)}), 409
 
-    return {**employee, "face_encoding_size": len(encoding)}
+    return jsonify({**employee, "face_encoding_size": len(encoding)}), 201
 
 
 @app.get("/employees")
-async def list_employees(status: str = Query(default=None, description="Filter by status: active | resigned")):
-    """List all employees, optionally filtered by status."""
-    return employees.list(status=status)
+def list_employees():
+    """List all employees. Query param: status=active|notice_period|resigned"""
+    return jsonify(employees.list(status=request.args.get("status")))
 
 
-@app.get("/employees/{employee_id}")
-async def get_employee(employee_id: str):
+@app.get("/employees/<employee_id>")
+def get_employee(employee_id):
     """Get details for a specific employee."""
     emp = employees.get(employee_id)
     if not emp:
-        raise HTTPException(404, "Employee not found")
-    return emp
+        return jsonify({"error": "Employee not found"}), 404
+    return jsonify(emp)
 
 
-@app.post("/employees/{employee_id}/resign")
-async def resign_employee(employee_id: str):
+@app.post("/employees/<employee_id>/resign")
+def resign_employee(employee_id):
     """
-    Mark an employee as resigned and automatically remove their face
-    from the allowed set. They will no longer be recognized by the camera.
-    Attendance history is preserved for records.
+    Begin the 60-day notice period. Face access is retained during this period
+    and revoked automatically when it ends.
     """
     try:
         emp = employees.resign(employee_id)
     except KeyError:
-        raise HTTPException(404, "Employee not found")
+        return jsonify({"error": "Employee not found"}), 404
     except ValueError as e:
-        raise HTTPException(409, str(e))
-    return {
+        return jsonify({"error": str(e)}), 409
+
+    return jsonify({
         "message": f"{emp['name']} resignation recorded. Face access will be revoked on {emp['notice_ends_at'][:10]}.",
         "employee": emp,
-    }
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=False)

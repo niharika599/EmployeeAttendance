@@ -1,6 +1,5 @@
-import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from typing import Optional
 
 import cv2
@@ -21,7 +20,7 @@ _IDLE = {
 
 
 class CameraWorker:
-    """Background async worker that continuously reads the camera and runs face recognition."""
+    """Background thread that continuously reads the camera and runs face recognition."""
 
     def __init__(
         self,
@@ -34,13 +33,12 @@ class CameraWorker:
         self.attendance = attendance
         self.camera_index = camera_index
         self.interval = interval
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._task: asyncio.Task | None = None
-        self.running = False
         self._lock = threading.Lock()
         self._state: dict = dict(_IDLE)
+        self._thread: Optional[threading.Thread] = None
+        self.running = False
 
-    # ── blocking capture (runs in thread pool) ─────────────────────────────────
+    # ── blocking capture ───────────────────────────────────────────────────────
 
     def _capture_and_recognize(self) -> dict:
         cap = cv2.VideoCapture(self.camera_index)
@@ -80,31 +78,25 @@ class CameraWorker:
             "attendance_marked": attendance_marked,
         }
 
-    # ── async loop ─────────────────────────────────────────────────────────────
+    # ── thread loop ────────────────────────────────────────────────────────────
 
-    async def _loop(self):
-        loop = asyncio.get_event_loop()
+    def _loop(self):
         while self.running:
             try:
-                result = await loop.run_in_executor(self._executor, self._capture_and_recognize)
+                result = self._capture_and_recognize()
                 with self._lock:
                     self._state = result
             except Exception as exc:
                 print(f"[CameraWorker] {exc}")
-            await asyncio.sleep(self.interval)
+            time.sleep(self.interval)
 
-    async def start(self):
+    def start(self):
         self.running = True
-        self._task = asyncio.create_task(self._loop())
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
-    async def stop(self):
+    def stop(self):
         self.running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
 
     @property
     def state(self) -> dict:
