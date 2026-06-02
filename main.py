@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from io import BytesIO
 
@@ -17,11 +18,22 @@ employees = EmployeeStore(store)
 camera = CameraWorker(store, attendance=attendance)
 
 
+async def _notice_period_checker():
+    """Runs every hour. Revokes face access for employees whose 60-day notice period has ended."""
+    while True:
+        expired = employees.expire_notice_periods()
+        for emp_id in expired:
+            print(f"[NoticeChecker] Notice period ended — access revoked for {emp_id}")
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await camera.start()
+    checker = asyncio.create_task(_notice_period_checker())
     yield
     await camera.stop()
+    checker.cancel()
 
 
 app = FastAPI(title="Face Recognition Door System", lifespan=lifespan)
@@ -211,6 +223,6 @@ async def resign_employee(employee_id: str):
     except ValueError as e:
         raise HTTPException(409, str(e))
     return {
-        "message": f"{emp['name']} marked as resigned and face access revoked",
+        "message": f"{emp['name']} resignation recorded. Face access will be revoked on {emp['notice_ends_at'][:10]}.",
         "employee": emp,
     }

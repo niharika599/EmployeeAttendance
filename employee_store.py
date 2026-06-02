@@ -1,8 +1,10 @@
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+NOTICE_PERIOD_DAYS = 60
 
 from face_store import FaceStore
 
@@ -58,22 +60,42 @@ class EmployeeStore:
 
     def resign(self, employee_id: str) -> dict:
         """
-        Mark employee as resigned and automatically remove their face
-        from the allowed set so they can no longer be recognized.
+        Begin the resignation process. Sets status to 'notice_period' and
+        schedules face removal after NOTICE_PERIOD_DAYS days.
+        The employee retains camera access until the notice period ends.
         """
         with self._lock:
             if employee_id not in self.employees:
                 raise KeyError(employee_id)
             emp = self.employees[employee_id]
-            if emp["status"] == "resigned":
-                raise ValueError(f"Employee '{employee_id}' is already resigned")
+            if emp["status"] in ("notice_period", "resigned"):
+                raise ValueError(f"Employee '{employee_id}' has already resigned")
 
-            self.face_store.remove(emp["face_id"])
-
-            emp["status"] = "resigned"
-            emp["resigned_at"] = datetime.now().isoformat()
+            now = datetime.now()
+            emp["status"] = "notice_period"
+            emp["resigned_at"] = now.isoformat()
+            emp["notice_ends_at"] = (now + timedelta(days=NOTICE_PERIOD_DAYS)).isoformat()
             self._save()
             return dict(emp)
+
+    def expire_notice_periods(self) -> list:
+        """
+        Called periodically. Finds employees whose notice period has ended,
+        removes their face from the allowed set, and marks them as 'resigned'.
+        Returns a list of expired employee_ids.
+        """
+        now = datetime.now()
+        expired = []
+        with self._lock:
+            for emp_id, emp in self.employees.items():
+                if emp["status"] == "notice_period":
+                    if now >= datetime.fromisoformat(emp["notice_ends_at"]):
+                        self.face_store.remove(emp["face_id"])
+                        emp["status"] = "resigned"
+                        expired.append(emp_id)
+            if expired:
+                self._save()
+        return expired
 
     # ── Read ───────────────────────────────────────────────────────────────────
 
