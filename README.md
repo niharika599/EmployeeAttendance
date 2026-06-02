@@ -18,7 +18,16 @@ An automatic door access and employee attendance system using face recognition. 
 
 ```
 faceRecognition/
-├── main.py               # Flask app + all API routes + background threads
+├── main.py               # Flask app factory, blueprint registration, error handlers
+├── stores.py             # Shared singleton instances (FaceStore, EmployeeStore, ...)
+├── utils.py              # Shared helpers (decode_image)
+├── api/
+│   ├── __init__.py
+│   ├── employees.py      # Blueprint → POST/GET /employees, POST /employees/:id/resign
+│   ├── faces.py          # Blueprint → GET /faces, DELETE /faces/:id
+│   ├── attendance.py     # Blueprint → GET /attendance/today|report|employee|date
+│   ├── validate.py       # Blueprint → POST /validate
+│   └── realtime.py       # Blueprint → GET /realtime/status
 ├── face_store.py         # Face encoding storage        → faces_db.json
 ├── employee_store.py     # Employee lifecycle management → employees_db.json
 ├── attendance_store.py   # Attendance records            → attendance_db.json
@@ -75,7 +84,7 @@ http://localhost:8000
 ```
 
 ### Camera index
-The default camera is `0` (built-in webcam). Change it in `main.py` if needed:
+The default camera is `0` (built-in webcam). Change it in `stores.py` if needed:
 ```python
 camera = CameraWorker(store, attendance=attendance, camera_index=1)
 ```

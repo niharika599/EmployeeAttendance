@@ -13,12 +13,13 @@ The system has five components communicating through shared in-memory state and 
 └──────────────────────────┬───────────────────────────────────────────┘
                            │ HTTP (REST)
 ┌──────────────────────────▼───────────────────────────────────────────┐
-│                          API LAYER  (main.py)                        │
+│               API LAYER  (Flask Blueprints — api/)                   │
 │                                                                      │
-│  POST /employees    GET /employees    POST /employees/:id/resign      │
-│  GET /faces         DELETE /faces/:id                                │
-│  POST /validate     GET /realtime/status                             │
-│  GET /attendance/today|report|employee/:id|date/:d                   │
+│  employees.py  │ POST/GET /employees  POST /employees/:id/resign     │
+│  faces.py      │ GET /faces           DELETE /faces/:id              │
+│  validate.py   │ POST /validate                                      │
+│  realtime.py   │ GET /realtime/status                                │
+│  attendance.py │ GET /attendance/today|report|employee/:id|date/:d   │
 └────┬──────────────┬──────────────────┬────────────────┬──────────────┘
      │              │                  │                │
 ┌────▼─────┐  ┌─────▼──────┐  ┌───────▼──────┐  ┌─────▼───────────────┐
@@ -40,16 +41,28 @@ The system has five components communicating through shared in-memory state and 
 
 ## 2. Component Breakdown
 
-### 2.1 API Layer — `main.py`
+### 2.1 API Layer — Flask Blueprints + `main.py`
 
 - Built on **Flask** (synchronous WSGI)
+- Routes are split into **five Blueprints** under `api/` — one per resource
 - All route handlers are plain `def` functions — no `async`
-- Handles `multipart/form-data` file uploads via `request.files` (Flask built-in)
-- Decodes uploaded images: Pillow → RGB → NumPy array → face_recognition
+- `stores.py` holds shared singleton instances; imported by each blueprint — no circular deps
+- `utils.py` holds `decode_image()` — shared by `employees.py` and `validate.py`
+- `main.py` is a thin **app factory** (`create_app()`): registers blueprints and error handlers
+- Centralised error handlers return consistent JSON for 400 / 404 / 405 / 500
 - Starts two background daemon threads at module load:
   - `CameraWorker.start()` — live recognition loop
   - `_notice_period_checker` — hourly notice period expiry check
-- All state is owned by the store classes; routes are stateless
+
+```
+main.py  (create_app)
+  ├── register api/employees.py  Blueprint
+  ├── register api/faces.py      Blueprint
+  ├── register api/attendance.py Blueprint
+  ├── register api/validate.py   Blueprint
+  ├── register api/realtime.py   Blueprint
+  └── @errorhandler 400/404/405/500
+```
 
 ---
 
@@ -217,7 +230,44 @@ threading.Thread(target=_notice_period_checker, daemon=True).start()
 
 ---
 
-## 3. Face Recognition Pipeline
+## 3. Project Layout
+
+```
+faceRecognition/
+├── main.py               # App factory + blueprint registration + error handlers
+├── stores.py             # Shared singletons: FaceStore, EmployeeStore,
+│                         #   AttendanceStore, CameraWorker
+├── utils.py              # decode_image() — Pillow → NumPy RGB array
+│
+├── api/                  # Flask Blueprints (one per resource)
+│   ├── __init__.py
+│   ├── employees.py      # /employees
+│   ├── faces.py          # /faces
+│   ├── attendance.py     # /attendance
+│   ├── validate.py       # /validate
+│   └── realtime.py       # /realtime
+│
+├── face_store.py         # FaceStore  →  faces_db.json
+├── employee_store.py     # EmployeeStore  →  employees_db.json
+├── attendance_store.py   # AttendanceStore  →  attendance_db.json
+└── camera_worker.py      # CameraWorker daemon thread
+```
+
+**Dependency flow (no circular imports):**
+```
+api/*.py  →  stores.py  →  face_store.py
+                        →  employee_store.py  →  face_store.py
+                        →  attendance_store.py
+                        →  camera_worker.py   →  face_store.py
+                                              →  attendance_store.py
+api/*.py  →  utils.py
+main.py   →  api/*.py
+main.py   →  stores.py
+```
+
+---
+
+## 4. Face Recognition Pipeline  
 
 Based on the CNN + HOG approach from the paper:
 
@@ -473,6 +523,10 @@ Three JSON files, each owned by one store class:
 | Decision | Choice | Reason |
 |---|---|---|
 | Web framework | Flask | Simple synchronous WSGI, no async complexity needed |
+| Route organisation | Flask Blueprints (`api/`) | One file per resource — clean separation, easy to extend |
+| Shared state | `stores.py` singletons | Single source of truth, no circular imports across blueprints |
+| Shared helpers | `utils.py` | `decode_image` reused by employees + validate blueprints |
+| App creation | `create_app()` factory | Testable, centralised error handlers, clean entry point |
 | Route functions | `def` only | Background work runs in daemon threads, not coroutines |
 | Background tasks | `threading.Thread(daemon=True)` | Camera and notice checker run independently of requests |
 | Face recognition | dlib CNN (128-d) | 98% accuracy, runs on Pi without GPU |
