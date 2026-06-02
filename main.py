@@ -3,14 +3,16 @@ from io import BytesIO
 
 import face_recognition
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from PIL import Image
 
+from attendance_store import AttendanceStore
 from camera_worker import CameraWorker
 from face_store import FaceStore
 
 store = FaceStore()
-camera = CameraWorker(store)
+attendance = AttendanceStore()
+camera = CameraWorker(store, attendance=attendance)
 
 
 @asynccontextmanager
@@ -99,12 +101,47 @@ async def realtime_status():
     """
     Return the latest recognition result from the live camera feed.
 
-    The camera worker runs asynchronously every 0.5 s and updates this state.
     Fields:
-      - camera_available : whether a camera was found
-      - face_detected    : whether a face is currently visible
-      - recognized       : whether that face is in the allowed set
-      - name / face_id   : identity if recognized
-      - confidence       : 0-1 similarity score (1 = perfect match)
+      - camera_available   : whether a camera was found
+      - face_detected      : whether a face is currently visible
+      - recognized         : whether that face is in the allowed set
+      - name / face_id     : identity if recognized
+      - confidence         : 0-1 similarity score (1 = perfect match)
+      - attendance_marked  : True if a new attendance record was just created
     """
     return camera.state
+
+
+# ── Attendance ─────────────────────────────────────────────────────────────────
+
+@app.get("/attendance/today")
+async def attendance_today():
+    """Return every attendance entry recorded today."""
+    return attendance.get_today()
+
+
+@app.get("/attendance/report")
+async def attendance_report(date: str = Query(default=None, description="YYYY-MM-DD (default: today)")):
+    """
+    Return one summary row per employee for the given date.
+    Each row includes check_in time, last_seen time, and total_entries.
+    """
+    return attendance.get_report(date)
+
+
+@app.get("/attendance/employee/{face_id}")
+async def attendance_by_employee(face_id: str):
+    """Return full attendance history for a specific employee."""
+    records = attendance.get_by_employee(face_id)
+    if not records:
+        raise HTTPException(404, "No attendance records found for this employee")
+    return records
+
+
+@app.get("/attendance/date/{date_str}")
+async def attendance_by_date(date_str: str):
+    """Return all attendance entries for a specific date (YYYY-MM-DD)."""
+    records = attendance.get_by_date(date_str)
+    if not records:
+        raise HTTPException(404, f"No attendance records found for {date_str}")
+    return records
