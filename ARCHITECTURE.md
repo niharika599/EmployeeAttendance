@@ -24,14 +24,14 @@ The system has five components communicating through shared in-memory state and 
 ┌────▼─────┐  ┌─────▼──────┐  ┌───────▼──────┐  ┌─────▼───────────────┐
 │ FACE     │  │ EMPLOYEE   │  │ ATTENDANCE   │  │ CAMERA WORKER       │
 │ STORE    │◄─│ STORE      │  │ STORE        │◄─│                     │
-│          │  │            │  │              │  │ AsyncIO Task        │
-│ faces_   │  │ employees_ │  │ attendance_  │  │ ThreadPoolExecutor  │
+│          │  │            │  │              │  │ daemon Thread       │
+│ faces_   │  │ employees_ │  │ attendance_  │  │ time.sleep(0.5s)    │
 │ db.json  │  │ db.json    │  │ db.json      │  │ Polls every 0.5s    │
 └──────────┘  └────────────┘  └──────────────┘  └─────────────────────┘
                                                           ▲
                                               ┌───────────┘
                                          NOTICE CHECKER
-                                         asyncio.Task
+                                         daemon Thread
                                          Runs every hour
                                          Expires notice periods
 ```
@@ -42,11 +42,12 @@ The system has five components communicating through shared in-memory state and 
 
 ### 2.1 API Layer — `main.py`
 
-- Built on **FastAPI** (async via uvicorn)
-- Handles `multipart/form-data` file uploads via `python-multipart`
+- Built on **Flask** (synchronous WSGI)
+- All route handlers are plain `def` functions — no `async`
+- Handles `multipart/form-data` file uploads via `request.files` (Flask built-in)
 - Decodes uploaded images: Pillow → RGB → NumPy array → face_recognition
-- Starts three background tasks at startup via `lifespan` context:
-  - `CameraWorker` — live recognition loop
+- Starts two background daemon threads at module load:
+  - `CameraWorker.start()` — live recognition loop
   - `_notice_period_checker` — hourly notice period expiry check
 - All state is owned by the store classes; routes are stateless
 
@@ -164,37 +165,45 @@ Records every recognition event with a cooldown guard to prevent duplicates.
 
 ### 2.5 Camera Worker — `camera_worker.py`
 
-Runs as a long-lived background task. Never blocks the API event loop.
+Runs as a long-lived daemon thread. Independent of the Flask request cycle.
 
 ```
-FastAPI startup  →  asyncio.create_task(_loop)
+Flask startup  →  threading.Thread(target=_loop, daemon=True).start()
                               │
                               ▼
                    ┌──────────────────────────┐
-                   │      _loop()  [async]    │
+                   │      _loop()  [thread]   │
                    │                          │
                    │  while running:          │
-                   │    run_in_executor(─────────► Thread (blocking)
-                   │      ThreadPoolExecutor) │       │
-                   │                          │  cv2.VideoCapture
-                   │    update _state         │  face_locations (HOG)
-                   │    (threading.Lock)      │  face_encodings (CNN)
-                   │                          │  FaceStore.find_match
-                   │    await sleep(0.5s)     │  AttendanceStore.mark
+                   │    _capture_and_         │
+                   │    recognize()           │
+                   │    │                     │
+                   │    ├── cv2.VideoCapture  │
+                   │    ├── face_locations    │
+                   │    ├── face_encodings    │
+                   │    ├── FaceStore.        │
+                   │    │   find_match()      │
+                   │    └── AttendanceStore.  │
+                   │        mark()            │
+                   │                          │
+                   │    update _state         │
+                   │    (threading.Lock)      │
+                   │                          │
+                   │    time.sleep(0.5s)      │
                    └──────────────────────────┘
 ```
 
-**Why ThreadPoolExecutor?**
-OpenCV and dlib are CPU-bound blocking calls. Running them in async would freeze the event loop and stall all HTTP requests. The executor moves them to a separate OS thread.
+**Why a daemon thread?**
+Flask is synchronous WSGI — there is no event loop to protect. A daemon thread runs independently alongside Flask's request handling and is automatically killed when the main process exits.
 
 ---
 
 ### 2.6 Notice Period Checker — `main.py`
 
-A simple async loop started at server startup alongside the camera worker.
+A plain daemon thread started at module load alongside the camera worker.
 
 ```
-asyncio.create_task(_notice_period_checker)
+threading.Thread(target=_notice_period_checker, daemon=True).start()
               │
               ▼
          while True:
@@ -203,7 +212,7 @@ asyncio.create_task(_notice_period_checker)
                    if now >= notice_ends_at:
                      FaceStore.remove(face_id)
                      status = "resigned"
-           await asyncio.sleep(3600)   ← check every hour
+           time.sleep(3600)   ← check every hour
 ```
 
 ---
@@ -261,7 +270,7 @@ Raw Image (upload or camera frame)
 Client
   │  POST /employees  (employee_id, name, image, email, dept, ...)
   ▼
-FastAPI
+Flask
   ├── Pillow: decode image → RGB numpy array
   ├── face_locations()  → detect face bounds
   ├── face_encodings()  → 128-float vector
@@ -304,7 +313,7 @@ GET /realtime/status  →  returns _state
 Client
   │  POST /employees/EMP001/resign
   ▼
-FastAPI → EmployeeStore.resign("EMP001")
+Flask → EmployeeStore.resign("EMP001")
   ├── status       = "notice_period"
   ├── resigned_at  = now
   ├── notice_ends_at = now + 60 days
@@ -332,7 +341,7 @@ FastAPI → EmployeeStore.resign("EMP001")
 Client
   │  POST /validate  (image=photo.jpg)
   ▼
-FastAPI
+Flask
   ├── decode image → face_encodings()
   └── FaceStore.find_match(encoding)
         ├── match  →  { access:"granted", name, confidence }
@@ -344,19 +353,19 @@ FastAPI
 ## 5. Concurrency Model
 
 ```
-uvicorn event loop (main thread)
+Flask main thread (WSGI)
 │
-├── HTTP request handlers          [async coroutines]
+├── HTTP request handlers          [def — synchronous]
 │
-├── CameraWorker._loop             [asyncio.Task]
-│     └── _capture_and_recognize  [ThreadPoolExecutor — blocking]
+├── CameraWorker._loop             [daemon Thread]
+│     └── _capture_and_recognize  [runs directly in thread — no executor needed]
 │
-├── _notice_period_checker         [asyncio.Task]
+├── _notice_period_checker         [daemon Thread]
 │     └── expire_notice_periods()  [sync, fast — in-memory scan]
 │
 └── Shared stores (FaceStore, EmployeeStore, AttendanceStore)
       └── threading.Lock on every read/write
-          (guards against CameraWorker thread vs API coroutine races)
+          (guards against CameraWorker/NoticeChecker threads vs Flask request threads)
 ```
 
 ---
@@ -427,9 +436,10 @@ Three JSON files, each owned by one store class:
 ┌───────────────────────────────────────┐
 │              Laptop                   │
 │  ┌──────────┐   ┌──────────────────┐  │
-│  │  Webcam  │──►│  uvicorn :8000   │  │
-│  └──────────┘   └──────────────────┘  │
-│                  localhost:8000/docs  │
+│  │  Webcam  │──►│  Flask  :8000    │  │
+│  └──────────┘   │  python main.py  │  │
+│                 └──────────────────┘  │
+│                  localhost:8000       │
 └───────────────────────────────────────┘
 ```
 
@@ -439,8 +449,9 @@ Three JSON files, each owned by one store class:
 ┌─────────────────────────────────────────────────────┐
 │                   Raspberry Pi                      │
 │  ┌──────────┐   ┌───────────────────────────────┐  │
-│  │  Camera  │──►│   uvicorn  0.0.0.0:8000       │  │
-│  └──────────┘   └───────────────────────────────┘  │
+│  │  Camera  │──►│   Flask  0.0.0.0:8000         │  │
+│  └──────────┘   │   python main.py              │  │
+│                 └───────────────────────────────┘  │
 │                           │                         │
 │              ┌────────────┼────────────┐            │
 │              ▼            ▼            ▼            │
@@ -451,7 +462,7 @@ Three JSON files, each owned by one store class:
          │  same LAN
          ▼
 ┌──────────────────┐
-│  Phone / Laptop  │──► http://<pi-ip>:8000/docs
+│  Phone / Laptop  │──► http://<pi-ip>:8000
 └──────────────────┘
 ```
 
@@ -461,11 +472,13 @@ Three JSON files, each owned by one store class:
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Web framework | FastAPI | Native async, auto Swagger docs, Pydantic validation |
+| Web framework | Flask | Simple synchronous WSGI, no async complexity needed |
+| Route functions | `def` only | Background work runs in daemon threads, not coroutines |
+| Background tasks | `threading.Thread(daemon=True)` | Camera and notice checker run independently of requests |
 | Face recognition | dlib CNN (128-d) | 98% accuracy, runs on Pi without GPU |
 | Detection model | HOG (not CNN) | Faster on CPU, sufficient for a door camera |
 | Storage | JSON files | No DB dependency, simple, portable |
-| Concurrency | AsyncIO + ThreadPoolExecutor | Camera blocking work off event loop |
+| Concurrency | threading.Thread + threading.Lock | Simpler than asyncio for CPU-bound background work |
 | Camera polling | 0.5s interval | Balances CPU load vs. responsiveness |
 | Face threshold | 0.6 Euclidean distance | Tunable sweet spot for accuracy vs. false positives |
 | Attendance cooldown | 5 minutes | Prevents duplicate entries from continuous camera |

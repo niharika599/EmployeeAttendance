@@ -1,6 +1,6 @@
 # Face Recognition Door System
 
-An automatic door access and employee attendance system using face recognition. A live camera identifies employees in real time, marks attendance automatically, and enforces access control — including a 60-day notice period when an employee resigns. Built with FastAPI + OpenCV + face-recognition (CNN/HOG).
+An automatic door access and employee attendance system using face recognition. A live camera identifies employees in real time, marks attendance automatically, and enforces access control — including a 60-day notice period when an employee resigns. Built with Flask + OpenCV + face-recognition (CNN/HOG).
 
 ---
 
@@ -18,11 +18,11 @@ An automatic door access and employee attendance system using face recognition. 
 
 ```
 faceRecognition/
-├── main.py               # FastAPI app + all API routes + background tasks
-├── face_store.py         # Face encoding storage       → faces_db.json
+├── main.py               # Flask app + all API routes + background threads
+├── face_store.py         # Face encoding storage        → faces_db.json
 ├── employee_store.py     # Employee lifecycle management → employees_db.json
-├── attendance_store.py   # Attendance records           → attendance_db.json
-├── camera_worker.py      # Async background camera + recognition loop
+├── attendance_store.py   # Attendance records            → attendance_db.json
+├── camera_worker.py      # Background camera thread + recognition loop
 ├── requirements.txt      # Python dependencies
 ├── README.md
 └── ARCHITECTURE.md
@@ -65,12 +65,13 @@ pip install -r requirements.txt
 
 ### 3. Run the server
 ```bash
-uvicorn main:app --reload
+python main.py
 ```
 
-### 4. Open the API docs
+### 4. Test the API
+Use curl, Postman, or any HTTP client:
 ```
-http://localhost:8000/docs
+http://localhost:8000
 ```
 
 ### Camera index
@@ -118,12 +119,12 @@ pip3 install opencv-python-headless
 
 ### 5. Run the server
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+python main.py
 ```
 
 Access from any device on the same network:
 ```
-http://<raspberry-pi-ip>:8000/docs
+http://<raspberry-pi-ip>:8000
 ```
 
 ### Run on startup (optional)
@@ -138,7 +139,7 @@ After=network.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/faceRecognition
-ExecStart=uvicorn main:app --host 0.0.0.0 --port 8000
+ExecStart=python main.py
 Restart=always
 
 [Install]
