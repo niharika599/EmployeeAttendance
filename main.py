@@ -8,10 +8,12 @@ from PIL import Image
 
 from attendance_store import AttendanceStore
 from camera_worker import CameraWorker
+from employee_store import EmployeeStore
 from face_store import FaceStore
 
 store = FaceStore()
 attendance = AttendanceStore()
+employees = EmployeeStore(store)
 camera = CameraWorker(store, attendance=attendance)
 
 
@@ -32,13 +34,18 @@ def _decode_image(data: bytes) -> np.ndarray:
 # ── Face management ────────────────────────────────────────────────────────────
 
 @app.post("/faces", status_code=201)
-async def add_face(name: str = Form(...), image: UploadFile = File(...)):
+async def add_face(
+    employee_id: str = Form(...),
+    name: str = Form(...),
+    image: UploadFile = File(...),
+):
     """
-    Register a face in the allowed set.
+    Register an employee face in the allowed set.
 
     Body (multipart/form-data):
-      - name  : display name for this person
-      - image : photo file containing exactly one face
+      - employee_id : unique employee identifier (e.g. EMP001)
+      - name        : display name
+      - image       : photo file containing exactly one face
     """
     img_array = _decode_image(await image.read())
     locations = face_recognition.face_locations(img_array, model="hog")
@@ -49,8 +56,15 @@ async def add_face(name: str = Form(...), image: UploadFile = File(...)):
         raise HTTPException(400, "Multiple faces found; upload a photo with one face only")
 
     encoding = face_recognition.face_encodings(img_array, locations)[0]
-    face_id = store.add(name, encoding)
-    return {"face_id": face_id, "name": name}
+    face_id = store.add(name, encoding, employee_id=employee_id)
+
+    try:
+        employee = employees.register(employee_id, name, face_id)
+    except ValueError as e:
+        store.remove(face_id)   # rollback face if employee already exists
+        raise HTTPException(409, str(e))
+
+    return {"face_id": face_id, "employee_id": employee_id, "name": name, "status": employee["status"]}
 
 
 @app.get("/faces")
@@ -145,3 +159,39 @@ async def attendance_by_date(date_str: str):
     if not records:
         raise HTTPException(404, f"No attendance records found for {date_str}")
     return records
+
+
+# ── Employee management ────────────────────────────────────────────────────────
+
+@app.get("/employees")
+async def list_employees(status: str = Query(default=None, description="Filter by status: active | resigned")):
+    """List all employees, optionally filtered by status."""
+    return employees.list(status=status)
+
+
+@app.get("/employees/{employee_id}")
+async def get_employee(employee_id: str):
+    """Get details for a specific employee."""
+    emp = employees.get(employee_id)
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    return emp
+
+
+@app.post("/employees/{employee_id}/resign")
+async def resign_employee(employee_id: str):
+    """
+    Mark an employee as resigned and automatically remove their face
+    from the allowed set. They will no longer be recognized by the camera.
+    Attendance history is preserved for records.
+    """
+    try:
+        emp = employees.resign(employee_id)
+    except KeyError:
+        raise HTTPException(404, "Employee not found")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {
+        "message": f"{emp['name']} marked as resigned and face access revoked",
+        "employee": emp,
+    }

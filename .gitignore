@@ -6,3 +6,4 @@ venv/
 .venv/
 faces_db.json
 attendance_db.json
+employees_db.json

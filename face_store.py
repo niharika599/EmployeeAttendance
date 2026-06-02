@@ -24,10 +24,14 @@ class FaceStore:
         with open(STORE_FILE, "w") as f:
             json.dump(self.faces, f)
 
-    def add(self, name: str, encoding: np.ndarray) -> str:
+    def add(self, name: str, encoding: np.ndarray, employee_id: str | None = None) -> str:
         face_id = str(uuid.uuid4())
         with self._lock:
-            self.faces[face_id] = {"name": name, "encoding": encoding.tolist()}
+            self.faces[face_id] = {
+                "name": name,
+                "employee_id": employee_id,
+                "encoding": encoding.tolist(),
+            }
             self._save()
         return face_id
 
@@ -41,7 +45,14 @@ class FaceStore:
 
     def list_faces(self) -> dict:
         with self._lock:
-            return {fid: {"id": fid, "name": data["name"]} for fid, data in self.faces.items()}
+            return {
+                fid: {
+                    "id": fid,
+                    "name": data["name"],
+                    "employee_id": data.get("employee_id"),
+                }
+                for fid, data in self.faces.items()
+            }
 
     def find_match(self, unknown_encoding: np.ndarray, tolerance: float = 0.6):
         with self._lock:
