@@ -31,51 +31,17 @@ def _decode_image(data: bytes) -> np.ndarray:
     return np.array(Image.open(BytesIO(data)).convert("RGB"))
 
 
-# ── Face management ────────────────────────────────────────────────────────────
-
-@app.post("/faces", status_code=201)
-async def add_face(
-    employee_id: str = Form(...),
-    name: str = Form(...),
-    image: UploadFile = File(...),
-):
-    """
-    Register an employee face in the allowed set.
-
-    Body (multipart/form-data):
-      - employee_id : unique employee identifier (e.g. EMP001)
-      - name        : display name
-      - image       : photo file containing exactly one face
-    """
-    img_array = _decode_image(await image.read())
-    locations = face_recognition.face_locations(img_array, model="hog")
-
-    if not locations:
-        raise HTTPException(400, "No face detected in the uploaded image")
-    if len(locations) > 1:
-        raise HTTPException(400, "Multiple faces found; upload a photo with one face only")
-
-    encoding = face_recognition.face_encodings(img_array, locations)[0]
-    face_id = store.add(name, encoding, employee_id=employee_id)
-
-    try:
-        employee = employees.register(employee_id, name, face_id)
-    except ValueError as e:
-        store.remove(face_id)   # rollback face if employee already exists
-        raise HTTPException(409, str(e))
-
-    return {"face_id": face_id, "employee_id": employee_id, "name": name, "status": employee["status"]}
-
+# ── Face utilities (read / delete) ────────────────────────────────────────────
 
 @app.get("/faces")
 async def list_faces():
-    """Return all registered (allowed) faces."""
+    """Return all registered faces with their employee_id references."""
     return store.list_faces()
 
 
 @app.delete("/faces/{face_id}")
 async def delete_face(face_id: str):
-    """Remove a face from the allowed set by its ID."""
+    """Remove a face encoding directly by face_id."""
     if not store.remove(face_id):
         raise HTTPException(404, "Face not found")
     return {"deleted": face_id}
@@ -162,6 +128,59 @@ async def attendance_by_date(date_str: str):
 
 
 # ── Employee management ────────────────────────────────────────────────────────
+
+@app.post("/employees", status_code=201)
+async def create_employee(
+    employee_id: str = Form(...),
+    name: str = Form(...),
+    image: UploadFile = File(...),
+    email: str = Form(default=None),
+    department: str = Form(default=None),
+    phone: str = Form(default=None),
+    designation: str = Form(default=None),
+):
+    """
+    Register a new employee with their details and face photo.
+
+    Body (multipart/form-data):
+      - employee_id  : unique identifier, e.g. EMP001  (required)
+      - name         : full name                        (required)
+      - image        : clear front-facing photo         (required)
+      - email        : work email                       (optional)
+      - department   : team or department name          (optional)
+      - phone        : contact number                   (optional)
+      - designation  : job title                        (optional)
+
+    The face in the photo is encoded and stored so the employee is
+    recognised by the live camera from this point on.
+    """
+    img_array = _decode_image(await image.read())
+    locations = face_recognition.face_locations(img_array, model="hog")
+
+    if not locations:
+        raise HTTPException(400, "No face detected in the uploaded image")
+    if len(locations) > 1:
+        raise HTTPException(400, "Multiple faces found; upload a photo with one face only")
+
+    encoding = face_recognition.face_encodings(img_array, locations)[0]
+    face_id = store.add(name, encoding, employee_id=employee_id)
+
+    try:
+        employee = employees.register(
+            employee_id=employee_id,
+            name=name,
+            face_id=face_id,
+            email=email,
+            department=department,
+            phone=phone,
+            designation=designation,
+        )
+    except ValueError as e:
+        store.remove(face_id)   # rollback face if employee_id is duplicate
+        raise HTTPException(409, str(e))
+
+    return {**employee, "face_encoding_size": len(encoding)}
+
 
 @app.get("/employees")
 async def list_employees(status: str = Query(default=None, description="Filter by status: active | resigned")):

@@ -27,13 +27,26 @@ class EmployeeStore:
 
     # ── Write ──────────────────────────────────────────────────────────────────
 
-    def register(self, employee_id: str, name: str, face_id: str) -> dict:
+    def register(
+        self,
+        employee_id: str,
+        name: str,
+        face_id: str,
+        email: Optional[str] = None,
+        department: Optional[str] = None,
+        phone: Optional[str] = None,
+        designation: Optional[str] = None,
+    ) -> dict:
         with self._lock:
             if employee_id in self.employees:
                 raise ValueError(f"Employee ID '{employee_id}' already exists")
             record = {
                 "employee_id": employee_id,
                 "name": name,
+                "email": email,
+                "department": department,
+                "phone": phone,
+                "designation": designation,
                 "face_id": face_id,
                 "status": "active",
                 "joined_at": datetime.now().isoformat(),
