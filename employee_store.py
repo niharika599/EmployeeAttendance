@@ -4,18 +4,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-NOTICE_PERIOD_DAYS = 60
-
 from face_store import FaceStore
 
 EMPLOYEE_FILE = Path("employees_db.json")
+NOTICE_PERIOD_DAYS = 60
 
 
 class EmployeeStore:
     def __init__(self, face_store: FaceStore):
         self.face_store = face_store
         self._lock = threading.Lock()
-        self.employees: dict = {}  # {employee_id: {...}}
+        self.employees: dict = {}
         self._load()
 
     def _load(self):
@@ -53,6 +52,7 @@ class EmployeeStore:
                 "status": "active",
                 "joined_at": datetime.now().isoformat(),
                 "resigned_at": None,
+                "notice_ends_at": None,
             }
             self.employees[employee_id] = record
             self._save()
@@ -60,7 +60,7 @@ class EmployeeStore:
 
     def resign(self, employee_id: str) -> dict:
         """
-        Begin the resignation process. Sets status to 'notice_period' and
+        Begin the resignation process. Sets status to notice_period and
         schedules face removal after NOTICE_PERIOD_DAYS days.
         The employee retains camera access until the notice period ends.
         """
@@ -80,9 +80,9 @@ class EmployeeStore:
 
     def expire_notice_periods(self) -> list:
         """
-        Called periodically. Finds employees whose notice period has ended,
-        removes their face from the allowed set, and marks them as 'resigned'.
-        Returns a list of expired employee_ids.
+        Called hourly. Removes face access for employees whose notice period
+        has ended and marks them as resigned.
+        Returns list of expired employee_ids.
         """
         now = datetime.now()
         expired = []
