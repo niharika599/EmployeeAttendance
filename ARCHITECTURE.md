@@ -4,29 +4,36 @@
 
 ## 1. System Overview
 
-The system is split into three independent layers that communicate through shared in-memory state and a REST API:
+The system has five components communicating through shared in-memory state and a REST API, with two long-running background tasks:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          CLIENT LAYER                           │
-│        Browser / Mobile App / Raspberry Pi GPIO Controller      │
-└───────────────────────┬─────────────────────────────────────────┘
-                        │ HTTP (REST)
-┌───────────────────────▼─────────────────────────────────────────┐
-│                          API LAYER                              │
-│                    FastAPI Application                          │
-│                                                                 │
-│   POST /faces     GET /faces     DELETE /faces    POST /validate│
-│   GET /realtime/status                                          │
-└───────────┬───────────────────────────┬─────────────────────────┘
-            │                           │
-┌───────────▼──────────┐   ┌────────────▼────────────────────────┐
-│    FACE STORE        │   │         CAMERA WORKER               │
-│                      │   │                                     │
-│  faces_db.json       │◄──│  AsyncIO Task → ThreadPoolExecutor  │
-│  (128-float vectors) │   │  OpenCV → face_recognition          │
-│  Thread-safe R/W     │   │  Polls every 0.5s                   │
-└──────────────────────┘   └─────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           CLIENT LAYER                               │
+│          Browser / Mobile App / Raspberry Pi GPIO Controller         │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │ HTTP (REST)
+┌──────────────────────────▼───────────────────────────────────────────┐
+│                          API LAYER  (main.py)                        │
+│                                                                      │
+│  POST /employees    GET /employees    POST /employees/:id/resign      │
+│  GET /faces         DELETE /faces/:id                                │
+│  POST /validate     GET /realtime/status                             │
+│  GET /attendance/today|report|employee/:id|date/:d                   │
+└────┬──────────────┬──────────────────┬────────────────┬──────────────┘
+     │              │                  │                │
+┌────▼─────┐  ┌─────▼──────┐  ┌───────▼──────┐  ┌─────▼───────────────┐
+│ FACE     │  │ EMPLOYEE   │  │ ATTENDANCE   │  │ CAMERA WORKER       │
+│ STORE    │◄─│ STORE      │  │ STORE        │◄─│                     │
+│          │  │            │  │              │  │ AsyncIO Task        │
+│ faces_   │  │ employees_ │  │ attendance_  │  │ ThreadPoolExecutor  │
+│ db.json  │  │ db.json    │  │ db.json      │  │ Polls every 0.5s    │
+└──────────┘  └────────────┘  └──────────────┘  └─────────────────────┘
+                                                          ▲
+                                              ┌───────────┘
+                                         NOTICE CHECKER
+                                         asyncio.Task
+                                         Runs every hour
+                                         Expires notice periods
 ```
 
 ---
@@ -35,95 +42,169 @@ The system is split into three independent layers that communicate through share
 
 ### 2.1 API Layer — `main.py`
 
-- Built on **FastAPI** (async WSGI via uvicorn)
-- Handles file uploads (`multipart/form-data`) using `python-multipart`
-- Decodes uploaded images via **Pillow** → converts to NumPy array for face_recognition
-- Stateless: all state lives in FaceStore and CameraWorker
-- Starts/stops CameraWorker via FastAPI `lifespan` context
-
-```
-Request → FastAPI route → decode image → face_recognition → FaceStore → JSON response
-```
+- Built on **FastAPI** (async via uvicorn)
+- Handles `multipart/form-data` file uploads via `python-multipart`
+- Decodes uploaded images: Pillow → RGB → NumPy array → face_recognition
+- Starts three background tasks at startup via `lifespan` context:
+  - `CameraWorker` — live recognition loop
+  - `_notice_period_checker` — hourly notice period expiry check
+- All state is owned by the store classes; routes are stateless
 
 ---
 
 ### 2.2 Face Store — `face_store.py`
 
-Responsible for persisting and querying the allowed face set.
+Lowest-level component. Stores and queries face encodings only.
 
 ```
-┌──────────────────────────────────────────────┐
-│                  FaceStore                   │
-│                                              │
-│  self.faces = {                              │
-│    "uuid-1": {                               │
-│      "name": "Niharika",                     │
-│      "encoding": [0.142, -0.089, ...]  ←── 128 floats (CNN output)
-│    }                                         │
-│  }                                           │
-│                                              │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐ │
-│  │  add()   │   │ remove() │   │  find_   │ │
-│  │          │   │          │   │  match() │ │
-│  └────┬─────┘   └────┬─────┘   └────┬─────┘ │
-│       │              │              │        │
-│       └──────────────┴──────────────┘        │
-│                      │                       │
-│              threading.Lock                  │
-│         (guards concurrent R/W)              │
-│                      │                       │
-│               faces_db.json                  │
-│            (persisted on disk)               │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                    FaceStore                     │
+│                                                  │
+│  self.faces = {                                  │
+│    "uuid-1": {                                   │
+│      "name":        "Niharika Pyla",             │
+│      "employee_id": "EMP001",                    │
+│      "encoding":    [0.142, -0.089, ...]  ← 128 floats
+│    }                                             │
+│  }                                               │
+│                                                  │
+│  add(name, encoding, employee_id)                │
+│  remove(face_id)         ← called by EmployeeStore
+│  find_match(encoding)    ← called by CameraWorker + /validate
+│  list_faces()                                    │
+│                                                  │
+│  threading.Lock  ──►  faces_db.json              │
+└──────────────────────────────────────────────────┘
 ```
 
 **Matching algorithm:**
 ```
-unknown_encoding  →  face_distance(all_known_encodings)
-                  →  pick lowest distance
-                  →  if distance <= 0.6 → match found
-                  →  confidence = 1 - distance
+unknown_encoding
+  → face_distance(all known encodings)   ← Euclidean distance
+  → pick minimum distance
+  → if distance <= 0.6  →  match (confidence = 1 - distance)
+  → else                →  no match
 ```
 
 ---
 
-### 2.3 Camera Worker — `camera_worker.py`
+### 2.3 Employee Store — `employee_store.py`
 
-Runs as a long-lived background task. Designed to never block the API event loop.
+Owns the full employee lifecycle. Calls FaceStore directly when revoking access.
 
 ```
-FastAPI startup
-     │
-     ▼
-asyncio.create_task(_loop)
-     │
-     ▼
-┌────────────────────────────────────────────┐
-│              _loop()  [async]              │
-│                                            │
-│  while running:                            │
-│    │                                       │
-│    ▼                                       │
-│  run_in_executor(ThreadPoolExecutor)       │
-│    │  (blocking work off the event loop)   │
-│    ▼                                       │
-│  _capture_and_recognize()  [sync/thread]   │
-│    │                                       │
-│    ├── cv2.VideoCapture(camera_index)      │
-│    ├── face_locations(rgb, model="hog")    │
-│    ├── face_encodings(rgb, locations)      │
-│    └── store.find_match(encoding)          │
-│    │                                       │
-│    ▼                                       │
-│  update self._state  (threading.Lock)      │
-│    │                                       │
-│    ▼                                       │
-│  await asyncio.sleep(0.5)  ← 2 FPS        │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                  EmployeeStore                   │
+│                                                  │
+│  self.employees = {                              │
+│    "EMP001": {                                   │
+│      employee_id, name, email,                   │
+│      department, phone, designation,             │
+│      face_id,                                    │
+│      status,          ← active | notice_period | resigned
+│      joined_at,                                  │
+│      resigned_at,     ← set on resign()          │
+│      notice_ends_at   ← resigned_at + 60 days    │
+│    }                                             │
+│  }                                               │
+│                                                  │
+│  register(...)        ← called by POST /employees│
+│  resign(employee_id)  ← sets notice_period       │
+│  expire_notice_periods()  ← called hourly        │
+│       └── face_store.remove(face_id)  ← auto-revoke
+│  get(employee_id)                                │
+│  list(status=None)                               │
+│                                                  │
+│  threading.Lock  ──►  employees_db.json          │
+└──────────────────────────────────────────────────┘
+```
+
+**Status transitions:**
+```
+active  ──[resign()]──►  notice_period  ──[60 days]──►  resigned
+  │                            │                            │
+face active              face active                  face removed
+attendance marked        attendance marked             no recognition
+```
+
+---
+
+### 2.4 Attendance Store — `attendance_store.py`
+
+Records every recognition event with a cooldown guard to prevent duplicates.
+
+```
+┌──────────────────────────────────────────────────┐
+│                 AttendanceStore                  │
+│                                                  │
+│  self.records = [                                │
+│    {                                             │
+│      id, face_id, name,                          │
+│      timestamp, date, time                       │
+│    }, ...                                        │
+│  ]                                               │
+│                                                  │
+│  mark(face_id, name, cooldown_minutes=5)         │
+│    └── scan backwards for same face_id           │
+│    └── skip if last entry < 5 min ago            │
+│    └── else append + save                        │
+│                                                  │
+│  get_today()                                     │
+│  get_by_date(date_str)                           │
+│  get_by_employee(face_id)                        │
+│  get_report(date)  ← groups by employee,         │
+│                       first=check_in,            │
+│                       last=last_seen             │
+│                                                  │
+│  threading.Lock  ──►  attendance_db.json         │
+└──────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.5 Camera Worker — `camera_worker.py`
+
+Runs as a long-lived background task. Never blocks the API event loop.
+
+```
+FastAPI startup  →  asyncio.create_task(_loop)
+                              │
+                              ▼
+                   ┌──────────────────────────┐
+                   │      _loop()  [async]    │
+                   │                          │
+                   │  while running:          │
+                   │    run_in_executor(─────────► Thread (blocking)
+                   │      ThreadPoolExecutor) │       │
+                   │                          │  cv2.VideoCapture
+                   │    update _state         │  face_locations (HOG)
+                   │    (threading.Lock)      │  face_encodings (CNN)
+                   │                          │  FaceStore.find_match
+                   │    await sleep(0.5s)     │  AttendanceStore.mark
+                   └──────────────────────────┘
 ```
 
 **Why ThreadPoolExecutor?**
-OpenCV and face_recognition are blocking (CPU-bound). Running them directly in an async function would freeze the event loop and stall all API requests. The executor moves the blocking work to a separate OS thread.
+OpenCV and dlib are CPU-bound blocking calls. Running them in async would freeze the event loop and stall all HTTP requests. The executor moves them to a separate OS thread.
+
+---
+
+### 2.6 Notice Period Checker — `main.py`
+
+A simple async loop started at server startup alongside the camera worker.
+
+```
+asyncio.create_task(_notice_period_checker)
+              │
+              ▼
+         while True:
+           EmployeeStore.expire_notice_periods()
+             └── for each employee with status=notice_period:
+                   if now >= notice_ends_at:
+                     FaceStore.remove(face_id)
+                     status = "resigned"
+           await asyncio.sleep(3600)   ← check every hour
+```
 
 ---
 
@@ -132,35 +213,30 @@ OpenCV and face_recognition are blocking (CPU-bound). Running them directly in a
 Based on the CNN + HOG approach from the paper:
 
 ```
-Raw Image (from upload or camera)
+Raw Image (upload or camera frame)
      │
      ▼
 ┌─────────────────────────────────┐
 │  Step 1: Face Detection (HOG)   │
-│                                 │
 │  Convert to grayscale           │
-│  Compute HOG gradients          │
+│  Compute gradient directions    │
 │  Slide detection window         │
-│  Output: [(top,right,bottom,    │
-│            left), ...]          │
+│  Output: bounding box list      │
 └────────────────┬────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────┐
 │  Step 2: Face Alignment         │
-│                                 │
 │  Find 68 facial landmarks       │
-│  (eyes, nose, mouth, chin)      │
-│  Affine transform to center     │
-│  eyes and mouth in fixed pos.   │
+│  Affine-transform image so      │
+│  eyes + mouth are centred       │
 └────────────────┬────────────────┘
                  │
                  ▼
 ┌─────────────────────────────────┐
 │  Step 3: CNN Encoding           │
-│                                 │
 │  Pass aligned face through      │
-│  deep CNN (ResNet variant)      │
+│  ResNet-based CNN               │
 │  Output: 128-float vector       │
 │  (unique face "fingerprint")    │
 └────────────────┬────────────────┘
@@ -168,12 +244,10 @@ Raw Image (from upload or camera)
                  ▼
 ┌─────────────────────────────────┐
 │  Step 4: Matching               │
-│                                 │
-│  Euclidean distance between     │
-│  unknown vector and all known   │
-│  vectors in FaceStore           │
+│  Euclidean distance vs all      │
+│  known vectors in FaceStore     │
 │  Threshold: 0.6                 │
-│  (SVM-style nearest-neighbour)  │
+│  Confidence: 1 - distance       │
 └─────────────────────────────────┘
 ```
 
@@ -181,70 +255,88 @@ Raw Image (from upload or camera)
 
 ## 4. Data Flow Diagrams
 
-### 4.1 Register a Face
+### 4.1 Register a New Employee
 
 ```
 Client
-  │
-  │  POST /faces  (name="Niharika", image=photo.jpg)
+  │  POST /employees  (employee_id, name, image, email, dept, ...)
   ▼
 FastAPI
-  │
-  ├── Pillow: decode JPEG → RGB numpy array
-  ├── face_recognition.face_locations()  → find face bounds
-  ├── face_recognition.face_encodings()  → 128-float vector
-  └── FaceStore.add("Niharika", encoding)
-        │
-        ├── assign uuid
-        ├── store in self.faces dict
-        └── write to faces_db.json
+  ├── Pillow: decode image → RGB numpy array
+  ├── face_locations()  → detect face bounds
+  ├── face_encodings()  → 128-float vector
+  ├── FaceStore.add(name, encoding, employee_id)  → face_id (uuid)
+  └── EmployeeStore.register(employee_id, name, face_id, ...)
+        ├── check duplicate employee_id  (409 if exists, rollback face)
+        └── save to employees_db.json
   │
   ▼
-{ "face_id": "uuid", "name": "Niharika" }  →  Client
+{ employee_id, name, face_id, face_encoding_size:128, status:"active", ... }
 ```
 
 ---
 
-### 4.2 Validate an Uploaded Photo
+### 4.2 Real-Time Attendance Marking
+
+```
+Camera
+  │  frame every 0.5s
+  ▼
+CameraWorker (background thread)
+  ├── face_locations()
+  ├── face_encodings()
+  ├── FaceStore.find_match()
+  │     └── match found: face_id="uuid", name="Niharika"
+  └── AttendanceStore.mark(face_id, name)
+        ├── last entry for this face < 5 min ago?  → skip
+        └── else: append record, save attendance_db.json
+
+_state = { recognized:true, name, face_id, confidence, attendance_marked:true }
+
+GET /realtime/status  →  returns _state
+```
+
+---
+
+### 4.3 Employee Resignation + Notice Period
 
 ```
 Client
+  │  POST /employees/EMP001/resign
+  ▼
+FastAPI → EmployeeStore.resign("EMP001")
+  ├── status       = "notice_period"
+  ├── resigned_at  = now
+  ├── notice_ends_at = now + 60 days
+  └── face stays in FaceStore (access continues)
   │
+  ▼
+{ message: "...access revoked on 2026-08-01", employee: {...} }
+
+                    ┌─────────────────────────────┐
+                    │  _notice_period_checker      │
+                    │  runs every hour             │
+                    │                              │
+                    │  now >= notice_ends_at?      │
+                    │    YES:                      │
+                    │      FaceStore.remove()      │
+                    │      status = "resigned"     │
+                    └─────────────────────────────┘
+```
+
+---
+
+### 4.4 Validate an Uploaded Photo
+
+```
+Client
   │  POST /validate  (image=photo.jpg)
   ▼
 FastAPI
-  │
-  ├── decode image → numpy array
-  ├── face_recognition.face_locations()
-  ├── face_recognition.face_encodings()  → unknown_encoding
-  └── FaceStore.find_match(unknown_encoding)
-        │
-        ├── compute face_distance vs all known encodings
-        ├── pick closest
-        └── compare against tolerance 0.6
-  │
-  ▼
-{ "access": "granted", "name": "Niharika", "confidence": 0.91 }  →  Client
-```
-
----
-
-### 4.3 Real-Time Camera Flow
-
-```
-                   ┌──────────────────────────────┐
-                   │      CameraWorker._loop       │
-                   │                               │
-  Camera ────────► │  capture frame every 0.5s     │
-  (OpenCV)         │  → detect faces               │
-                   │  → encode faces               │
-                   │  → match against FaceStore    │
-                   │  → update self._state         │
-                   └──────────────────────────────┘
-                                │
-                                │  (shared state, thread-safe)
-                                │
-  Client ──── GET /realtime/status ────► FastAPI ──► return self._state
+  ├── decode image → face_encodings()
+  └── FaceStore.find_match(encoding)
+        ├── match  →  { access:"granted", name, confidence }
+        └── no match  →  { access:"denied" }
 ```
 
 ---
@@ -252,41 +344,78 @@ FastAPI
 ## 5. Concurrency Model
 
 ```
-Main Thread (uvicorn event loop)
+uvicorn event loop (main thread)
 │
-├── handles all HTTP requests (async)
-├── runs CameraWorker._loop as asyncio.Task
-│     │
-│     └── offloads blocking I/O to ThreadPoolExecutor
-│           │
-│           └── Thread 1: OpenCV capture + face recognition
+├── HTTP request handlers          [async coroutines]
 │
-└── FaceStore shared between event loop + worker thread
-      └── threading.Lock prevents race conditions
+├── CameraWorker._loop             [asyncio.Task]
+│     └── _capture_and_recognize  [ThreadPoolExecutor — blocking]
+│
+├── _notice_period_checker         [asyncio.Task]
+│     └── expire_notice_periods()  [sync, fast — in-memory scan]
+│
+└── Shared stores (FaceStore, EmployeeStore, AttendanceStore)
+      └── threading.Lock on every read/write
+          (guards against CameraWorker thread vs API coroutine races)
 ```
 
 ---
 
 ## 6. Storage Design
 
-```
-faces_db.json
+Three JSON files, each owned by one store class:
+
+### faces_db.json
+```json
 {
   "<uuid>": {
-    "name": "string",
-    "encoding": [float × 128]   ← CNN face vector
+    "name": "Niharika Pyla",
+    "employee_id": "EMP001",
+    "encoding": [0.142, -0.089, ...]
   }
 }
+```
+
+### employees_db.json
+```json
+{
+  "EMP001": {
+    "employee_id": "EMP001",
+    "name": "Niharika Pyla",
+    "email": "n@company.com",
+    "department": "Engineering",
+    "phone": "+91-999...",
+    "designation": "Senior SWE",
+    "face_id": "<uuid>",
+    "status": "notice_period",
+    "joined_at": "2026-01-15T09:00:00",
+    "resigned_at": "2026-06-02T10:00:00",
+    "notice_ends_at": "2026-08-01T10:00:00"
+  }
+}
+```
+
+### attendance_db.json
+```json
+[
+  {
+    "id": "<uuid>",
+    "face_id": "<uuid>",
+    "name": "Niharika Pyla",
+    "timestamp": "2026-06-02T09:01:12",
+    "date": "2026-06-02",
+    "time": "09:01:12"
+  }
+]
 ```
 
 | Property | Detail |
 |---|---|
 | Format | JSON (human-readable, portable) |
 | Location | Same directory as `main.py` |
-| Written | On every add / delete |
-| Read | Once at startup |
-| Thread safety | `threading.Lock` in FaceStore |
+| Thread safety | `threading.Lock` per store |
 | Persistence | Survives server restarts |
+| Ignored by git | Listed in `.gitignore` |
 
 ---
 
@@ -297,35 +426,28 @@ faces_db.json
 ```
 ┌───────────────────────────────────────┐
 │              Laptop                   │
-│                                       │
-│  ┌──────────┐     ┌─────────────────┐ │
-│  │  Webcam  │────►│  Python Server  │ │
-│  └──────────┘     │  uvicorn :8000  │ │
-│                   └────────┬────────┘ │
-│                            │          │
-│                   localhost:8000/docs │
+│  ┌──────────┐   ┌──────────────────┐  │
+│  │  Webcam  │──►│  uvicorn :8000   │  │
+│  └──────────┘   └──────────────────┘  │
+│                  localhost:8000/docs  │
 └───────────────────────────────────────┘
 ```
-
----
 
 ### 7.2 Raspberry Pi (Production Door System)
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   Raspberry Pi                      │
-│                                                     │
 │  ┌──────────┐   ┌───────────────────────────────┐  │
-│  │  Camera  │──►│   Python Server  :8000        │  │
+│  │  Camera  │──►│   uvicorn  0.0.0.0:8000       │  │
 │  └──────────┘   └───────────────────────────────┘  │
 │                           │                         │
 │              ┌────────────┼────────────┐            │
 │              ▼            ▼            ▼            │
 │         GPIO 4        GPIO 3      Network           │
 │        Servo Motor    Buzzer    0.0.0.0:8000        │
-│        (door lock)  (alert)   (remote API access)  │
+│        (door lock)  (alert)   (remote API)         │
 └─────────────────────────────────────────────────────┘
-         │
          │  same LAN
          ▼
 ┌──────────────────┐
@@ -339,13 +461,18 @@ faces_db.json
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Web framework | FastAPI | Native async, auto Swagger docs, typed |
+| Web framework | FastAPI | Native async, auto Swagger docs, Pydantic validation |
 | Face recognition | dlib CNN (128-d) | 98% accuracy, runs on Pi without GPU |
-| Detection model | HOG (not CNN) | Faster on CPU, sufficient for door use |
-| Storage | JSON file | No DB dependency, simple, portable |
-| Concurrency | AsyncIO + ThreadPoolExecutor | Keeps API responsive while camera runs |
+| Detection model | HOG (not CNN) | Faster on CPU, sufficient for a door camera |
+| Storage | JSON files | No DB dependency, simple, portable |
+| Concurrency | AsyncIO + ThreadPoolExecutor | Camera blocking work off event loop |
 | Camera polling | 0.5s interval | Balances CPU load vs. responsiveness |
-| Face threshold | 0.6 Euclidean distance | Default sweet spot; tunable per environment |
+| Face threshold | 0.6 Euclidean distance | Tunable sweet spot for accuracy vs. false positives |
+| Attendance cooldown | 5 minutes | Prevents duplicate entries from continuous camera |
+| Notice period | 60 days | Business rule; configurable via `NOTICE_PERIOD_DAYS` |
+| Notice checker interval | 1 hour | Granularity sufficient; not day-critical |
+| Atomic registration | Face + employee in one request | Prevents orphaned face records |
+| Rollback on conflict | Remove face if employee_id duplicate | Keeps stores consistent |
 
 ---
 
@@ -354,8 +481,10 @@ faces_db.json
 | Limitation | Improvement |
 |---|---|
 | Single camera only | Support multiple camera streams |
-| JSON flat file | Migrate to SQLite or PostgreSQL for scale |
-| No authentication on API | Add API key or OAuth2 |
-| No alert on unknown face | Add email / WhatsApp notification (as in paper) |
-| HOG detection misses side profiles | Switch to CNN model (`model="cnn"`) with GPU |
-| No audit log | Log every access attempt with timestamp |
+| JSON flat files | Migrate to SQLite or PostgreSQL for scale |
+| No API authentication | Add API key or OAuth2 |
+| No alert on unknown face | Add email / WhatsApp notification |
+| HOG misses side profiles | Use CNN model (`model="cnn"`) with GPU |
+| Attendance not linked to employee record directly | Add `employee_id` field to attendance records |
+| Notice checker runs even when no notice_period employees exist | Add early-exit when queue is empty |
+| No report export | Add CSV / PDF export for attendance reports |
