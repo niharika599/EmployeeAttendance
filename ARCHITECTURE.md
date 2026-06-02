@@ -267,7 +267,7 @@ main.py   →  stores.py
 
 ---
 
-## 4. Face Recognition Pipeline  
+## 4. Face Recognition Pipeline
 
 Based on the CNN + HOG approach from the paper:
 
@@ -312,16 +312,16 @@ Raw Image (upload or camera frame)
 
 ---
 
-## 4. Data Flow Diagrams
+## 5. Data Flow Diagrams
 
-### 4.1 Register a New Employee
+### 5.1 Register a New Employee
 
 ```
 Client
   │  POST /employees  (employee_id, name, image, email, dept, ...)
   ▼
-Flask
-  ├── Pillow: decode image → RGB numpy array
+Flask  (api/employees.py)
+  ├── utils.decode_image() → RGB numpy array
   ├── face_locations()  → detect face bounds
   ├── face_encodings()  → 128-float vector
   ├── FaceStore.add(name, encoding, employee_id)  → face_id (uuid)
@@ -335,7 +335,7 @@ Flask
 
 ---
 
-### 4.2 Real-Time Attendance Marking
+### 5.2 Real-Time Attendance Marking
 
 ```
 Camera
@@ -357,24 +357,24 @@ GET /realtime/status  →  returns _state
 
 ---
 
-### 4.3 Employee Resignation + Notice Period
+### 5.3 Employee Resignation + Notice Period
 
 ```
 Client
   │  POST /employees/EMP001/resign
   ▼
-Flask → EmployeeStore.resign("EMP001")
-  ├── status       = "notice_period"
-  ├── resigned_at  = now
+Flask  (api/employees.py)  →  EmployeeStore.resign("EMP001")
+  ├── status         = "notice_period"
+  ├── resigned_at    = now
   ├── notice_ends_at = now + 60 days
-  └── face stays in FaceStore (access continues)
+  └── face stays in FaceStore (access continues during notice period)
   │
   ▼
 { message: "...access revoked on 2026-08-01", employee: {...} }
 
                     ┌─────────────────────────────┐
                     │  _notice_period_checker      │
-                    │  runs every hour             │
+                    │  daemon thread, every hour   │
                     │                              │
                     │  now >= notice_ends_at?      │
                     │    YES:                      │
@@ -385,14 +385,14 @@ Flask → EmployeeStore.resign("EMP001")
 
 ---
 
-### 4.4 Validate an Uploaded Photo
+### 5.4 Validate an Uploaded Photo
 
 ```
 Client
   │  POST /validate  (image=photo.jpg)
   ▼
-Flask
-  ├── decode image → face_encodings()
+Flask  (api/validate.py)
+  ├── utils.decode_image() → face_encodings()
   └── FaceStore.find_match(encoding)
         ├── match  →  { access:"granted", name, confidence }
         └── no match  →  { access:"denied" }
@@ -400,7 +400,7 @@ Flask
 
 ---
 
-## 5. Concurrency Model
+## 6. Concurrency Model
 
 ```
 Flask main thread (WSGI)
@@ -420,7 +420,7 @@ Flask main thread (WSGI)
 
 ---
 
-## 6. Storage Design
+## 7. Storage Design
 
 Three JSON files, each owned by one store class:
 
@@ -478,9 +478,9 @@ Three JSON files, each owned by one store class:
 
 ---
 
-## 7. Deployment Architectures
+## 8. Deployment Architectures
 
-### 7.1 Laptop (Development)
+### 8.1 Laptop (Development)
 
 ```
 ┌───────────────────────────────────────┐
@@ -493,7 +493,7 @@ Three JSON files, each owned by one store class:
 └───────────────────────────────────────┘
 ```
 
-### 7.2 Raspberry Pi (Production Door System)
+### 8.2 Raspberry Pi (Production Door System)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -518,7 +518,7 @@ Three JSON files, each owned by one store class:
 
 ---
 
-## 8. Key Design Decisions
+## 9. Key Design Decisions
 
 | Decision | Choice | Reason |
 |---|---|---|
@@ -543,7 +543,7 @@ Three JSON files, each owned by one store class:
 
 ---
 
-## 9. Limitations & Future Improvements
+## 10. Limitations & Future Improvements
 
 | Limitation | Improvement |
 |---|---|
